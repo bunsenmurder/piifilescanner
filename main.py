@@ -7,17 +7,19 @@ import sys
 from typing import List
 from datetime import datetime
 from pathlib import Path
-
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from itertools import zip_longest
 # Apache Tika Python Client Library (Downloads Tika Server in Code) - https://github.com/chrismattmann/tika-python
 os.environ['PYTHONIOENCODING'] = 'utf8'
 from tika import parser
 
-from concurrent.futures import as_completed, ThreadPoolExecutor
+
 regex_flags = re.MULTILINE | re.DOTALL
 # Regex String Sourced from https://github.com/microsoft/presidio/blob/main/presidio-analyzer/presidio_analyzer/predefined_recognizers/us_ssn_recognizer.py
 social_security_regex = re.compile(r"\b([0-9]{3})[- .]([0-9]{2})[- .]([0-9]{4})\b", regex_flags)
 # Regex String Sourced from https://github.com/microsoft/presidio/blob/main/presidio-analyzer/presidio_analyzer/predefined_recognizers/credit_card_recognizer.py
 weak_credit_card_regex = re.compile(r"\b((4\d{3})|(5[0-5]\d{2})|(6\d{3})|(1\d{3})|(3\d{3}))[- ]?(\d{3,4})[- ]?(\d{3,4})[- ]?(\d{3,5})\b", regex_flags)
+
 
 def luhn_checksum(sanitized_value: str) -> bool:
     '''Luhn Checksum checker sourced from https://github.com/microsoft/presidio/blob/main/presidio-analyzer/presidio_analyzer/predefined_recognizers/credit_card_recognizer.py'''
@@ -31,6 +33,7 @@ def luhn_checksum(sanitized_value: str) -> bool:
         checksum += sum(digits_of(str(d * 2)))
     return checksum % 10 == 0
 
+
 def scan_directory_for_files(scan_dir):
     '''Scans through entire directory tree for files'''
     return_files_list = []
@@ -41,6 +44,20 @@ def scan_directory_for_files(scan_dir):
             else:
                 return_files_list.extend([root + '/' + file for file in files_list])
     return return_files_list
+
+def scan_files_and_chunk(scan_dir):
+    file_paths_dict_list = []
+    file_paths = scan_directory_for_files(scan_dir)
+    print(f"Found {len(file_paths)} files. Commencing content scan!")
+    if file_paths:
+        if len(file_paths) >= 5000:
+            args = [iter(file_paths)] * 5000
+            for file_paths_chunk in zip_longest(*args, fillvalue=None):
+                file_paths_dict_list.append({file_path: {'scanned': "", 'credit_card_found': False, 'social_security_found': False} for file_path in file_paths_chunk if file_path})
+        else:
+            file_paths_dict_list.append(
+                {file_path: {'scanned': "", 'credit_card_found': False, 'social_security_found': False} for file_path in file_paths})
+    return file_paths_dict_list
 
 def content_scan(file_path):
     '''Uses Apache Tika to scan contents of the file'''
@@ -61,14 +78,12 @@ def content_scan(file_path):
         parse_status = "NA"
     return parse_status, parsed_content
 
-def main_file_scan_interface(scan_dir):
-    file_paths = scan_directory_for_files(scan_dir)
-    file_paths_dict = {file_path: {'scanned': "", 'credit_card_found': False, 'social_security_found': False} for file_path in file_paths}
+def pii_threaded_content_scan(file_paths_dict):
     flagged_files_report_dict = {}
-    if file_paths_dict:
-        with ThreadPoolExecutor() as executor:
-            file_scan_jobs = {executor.submit(content_scan, file_path): file_path for file_path, _ in file_paths_dict.items()}
-            finished_file_scan_paths = []
+    print(f"Scanning file content...")
+    with ThreadPoolExecutor() as executor:
+        file_scan_jobs = {executor.submit(content_scan, file_path): file_path for file_path, _ in file_paths_dict.items()}
+        try:
             for file_scan_job_future in as_completed(file_scan_jobs, 180):
                 flag_file = False
                 file_path = file_scan_jobs[file_scan_job_future]
@@ -76,7 +91,6 @@ def main_file_scan_interface(scan_dir):
                     content_scan_status, file_content = file_scan_job_future.result()
                 except Exception as e:
                     content_scan_status, file_content = "NA", ""
-                #finished_file_scan_paths.append(file_scan_jobs[file_scan_job_future])
                 file_info = file_paths_dict[file_path]
                 file_info['scanned'] = content_scan_status
                 if content_scan_status == "Y":
@@ -97,6 +111,15 @@ def main_file_scan_interface(scan_dir):
                         'credit_card_found': "Yes" if file_info['credit_card_found'] else "No",
                         'social_security_found': "Yes" if file_info['social_security_found'] else "No"
                     }
+        except Exception as e:
+            print(f"Skipping scan of {len(flagged_files_report_dict)} files due to error: {e}")
+    return flagged_files_report_dict
+
+def main_file_scan_interface(scan_dir):
+    flagged_files_report_dict = {}
+    file_paths_dict_list = scan_files_and_chunk(scan_dir)
+    for file_paths_dict in file_paths_dict_list:
+        flagged_files_report_dict.update(pii_threaded_content_scan(file_paths_dict))
     return flagged_files_report_dict
 
 
